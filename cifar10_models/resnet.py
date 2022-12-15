@@ -88,6 +88,44 @@ class ResNet(nn.Module):
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
+    def get_bn_before_relu(self):
+        if isinstance(self.layer1[0], Bottleneck):
+            bn1 = self.layer1[-1].bn3
+            bn2 = self.layer2[-1].bn3
+            bn3 = self.layer3[-1].bn3
+        elif isinstance(self.layer1[0], BasicBlock):
+            bn1 = self.layer1[-1].bn2
+            bn2 = self.layer2[-1].bn2
+            bn3 = self.layer3[-1].bn2
+        else:
+            print('ResNet unknown block error !!!')
+
+        return [bn1, bn2, bn3]
+
+    def get_channel_num(self):
+
+        return [16, 32, 64]
+
+    def extract_feature(self, x, preReLU=False):
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+
+        feat1 = self.layer1(x)
+        feat2 = self.layer2(feat1)
+        feat3 = self.layer3(feat2)
+
+        x = F.relu(feat3)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        out = self.fc(x)
+
+        if not preReLU:
+            feat1 = F.relu(feat1)
+            feat2 = F.relu(feat2)
+            feat3 = F.relu(feat3)
+
+        return [feat1, feat2, feat3], out
 
 
 def resnet18():

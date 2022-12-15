@@ -1,22 +1,23 @@
 import os
 import argparse
 import torch
-import time
 from rslad_loss import *
 from cifar10_models import *
 import torchvision
 from torchvision import datasets, transforms
+import time
 # we fix the random seed to 0, this method can keep the results consistent in the same conputer.
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
 torch.backends.cudnn.deterministic = True
-
+use_cuda = torch.cuda.is_available()
+criterion_CE = nn.CrossEntropyLoss()
 prefix = 'resnet18-CIFAR10_RSLAD'
 epochs = 300
 batch_size = 128
 epsilon = 8/255.0 #perturbation
-criterion_CE = nn.CrossEntropyLoss()
-use_cuda = torch.cuda.is_available()
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 transform_train = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
@@ -33,9 +34,9 @@ testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True
 testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
 
 student = resnet18()
-student = torch.nn.DataParallel(student)
-student = student.cuda()
-student.train()
+# student = torch.nn.DataParallel(student)
+# student = student.cuda()
+
 optimizer = optim.SGD(student.parameters(), lr=0.1, momentum=0.9, weight_decay=2e-4)
 def kl_loss(a,b):
     loss = -a*b + torch.log(b+1e-5)*b
@@ -62,10 +63,19 @@ def test(net):
     print('Loss: %.3f | Acc: %.3f%% (%d/%d)' % (test_loss / (b_idx + 1), 100. * correct / total, correct, total))
     return test_loss / (b_idx + 1), correct / total
 teacher = wideresnet()
+
 teacher.load_state_dict(torch.load('./models/model_cifar_wrn.pt'))
-teacher = torch.nn.DataParallel(teacher)
-teacher = teacher.cuda() #84.92
+
+# teacher = torch.nn.DataParallel(teacher)
+# teacher = teacher.cuda()
+if torch.cuda.device_count() > 1:
+    teacher = nn.DataParallel(teacher).to(device)
+    student = nn.DataParallel(student).to(device)
+else:
+    teacher = teacher.to(device)
+    student = student.to(device)
 test(teacher)
+student.train()
 teacher.eval()
 
 for epoch in range(1,epochs+1):
@@ -75,12 +85,19 @@ for epoch in range(1,epochs+1):
         train_batch_labels = train_batch_labels.cuda()
         optimizer.zero_grad()
         with torch.no_grad():
-            teacher_logits = teacher(train_batch_data)
+            # teacher_logits = teacher(train_batch_data)
+            t_feats, teacher_logits = teacher.extract_feature(train_batch_data, preReLU=True)
 
-        adv_logits, train_batch_data_adv, s_adv_feats = rslad_inner_loss(student,teacher_logits,train_batch_data,train_batch_labels,optimizer,step_size=2/255.0,epsilon=epsilon,perturb_steps=10)
+        # adv_logits = rslad_inner_loss(student,teacher_logits,train_batch_data,train_batch_labels,optimizer,step_size=2/255.0,epsilon=epsilon,perturb_steps=10)
+        s_adv_logits, train_batch_data_adv, s_adv_feats = rslad_inner_loss(student, teacher_logits,
+                                                                                       train_batch_data,
+                                                                                       train_batch_labels, optimizer,
+                                                                                       step_size=2 / 255.0,
+                                                                                       epsilon=epsilon,
+                                                                                       perturb_steps=10)
         student.train()
         nat_logits = student(train_batch_data)
-        kl_Loss1 = kl_loss(F.log_softmax(adv_logits,dim=1),F.softmax(teacher_logits.detach(),dim=1))
+        kl_Loss1 = kl_loss(F.log_softmax(s_adv_logits,dim=1),F.softmax(teacher_logits.detach(),dim=1))
         kl_Loss2 = kl_loss(F.log_softmax(nat_logits,dim=1),F.softmax(teacher_logits.detach(),dim=1))
         kl_Loss1 = torch.mean(kl_Loss1)
         kl_Loss2 = torch.mean(kl_Loss2)
@@ -93,8 +110,10 @@ for epoch in range(1,epochs+1):
         test_accs = []
         student.eval()
         for step,(test_batch_data,test_batch_labels) in enumerate(testloader):
+            test_batch_data = test_batch_data.float().cuda()
+            test_batch_labels = test_batch_labels.cuda()
             test_ifgsm_data = attack_pgd(student,test_batch_data,test_batch_labels,attack_iters=20,step_size=0.003,epsilon=8.0/255.0)
-            logits = student(test_ifgsm_data)
+            logits = student(test_ifgsm_data.cuda())
             predictions = np.argmax(logits.cpu().detach().numpy(),axis=1)
             predictions = predictions - test_batch_labels.cpu().detach().numpy()
             test_accs = test_accs + predictions.tolist()

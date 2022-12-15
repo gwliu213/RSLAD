@@ -11,7 +11,7 @@ def attack_pgd(model,train_batch_data,train_batch_labels,attack_iters=10,step_si
     train_ifgsm_data = torch.clamp(train_ifgsm_data,0,1)
     for i in range(attack_iters):
         train_ifgsm_data.requires_grad_()
-        logits = model(train_ifgsm_data)
+        logits = model(train_ifgsm_data.cuda())
         loss = ce_loss(logits,train_batch_labels.cuda())
         loss.backward()
         train_grad = train_ifgsm_data.grad.detach()
@@ -23,10 +23,10 @@ def attack_pgd(model,train_batch_data,train_batch_labels,attack_iters=10,step_si
         train_ifgsm_data = train_ifgsm_data.detach()
     return train_ifgsm_data
 
-def rslad_inner_loss(model,
+def rslad_inner_loss(model, #student
                 teacher_logits,
-                x_natural,
-                y,
+                x_natural,#train_batch_data
+                y, # train_batch_labels
                 optimizer,
                 step_size=0.003,
                 epsilon=0.031,
@@ -56,5 +56,10 @@ def rslad_inner_loss(model,
     # zero gradient
     optimizer.zero_grad()
     logits = model(x_adv)
-    return logits
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module
+    else:
+        model = model
+    s_feats = model.extract_feature(x_adv)
+    return logits,x_adv,s_feats
   

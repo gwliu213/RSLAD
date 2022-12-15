@@ -6,12 +6,14 @@ import torch
 from rslad_loss import *
 from cifar10_models import *
 import torchvision
+import time
 from torchvision import datasets, transforms
 import numpy as np
 import cv2
 import skimage.transform
 import torch.nn as nn
 import torch.nn. functional as F
+import distiller_london as distiller_mine
 import torchvision.transforms.functional as trans_resize
 from PIL import Image
 from matplotlib.pyplot import imshow
@@ -28,10 +30,11 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
 torch.backends.cudnn.deterministic = True
-
+use_cuda = torch.cuda.is_available()
+criterion_CE = nn.CrossEntropyLoss()
 prefix = 'resnet18-CIFAR10_RSLAD'
 epochs = 300
-batch_size = 16#128
+batch_size = 128#128
 epsilon = 8/255.0 #perturbation
 
 def get_args():
@@ -127,8 +130,28 @@ def saveCam(cam,batch_size,targets,input_tensor,train_batch_data,file_name):
         big_cam_image = cv2.resize(cam_image, (224, 224), interpolation=cv2.INTER_CUBIC)
         cv2.imwrite('./sample/'+file_name+str(i)+'.png', big_img)
         cv2.imwrite('./sample/'+'cam'+file_name+str(i)+'.jpg', big_cam_image)
+    return grayscale_cams
+def test(net,testloader):
+    epoch_start_time = time.time()
+    net.eval()
+    test_loss = 0
+    correct = 0
+    total = 0
+    for batch_idx, (inputs, targets) in enumerate(testloader):
+        if use_cuda:
+            inputs, targets = inputs.cuda(), targets.cuda()
+        outputs = net(inputs)
+        loss = criterion_CE(outputs, targets)
 
+        test_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        total += targets.size(0)
+        correct += predicted.eq(targets.data).cpu().sum().float().item()
+        b_idx = batch_idx
 
+    print('Test \t Time Taken: %.2f sec' % (time.time() - epoch_start_time))
+    print('Loss: %.3f | Acc: %.3f%% (%d/%d)' % (test_loss / (b_idx + 1), 100. * correct / total, correct, total))
+    return test_loss / (b_idx + 1), correct / total
 #
 if __name__ == '__main__':
     """ python vit_gradcam.py --image-path <path_to_image>
@@ -145,16 +168,25 @@ if __name__ == '__main__':
 
     if args.method not in list(methods.keys()):
         raise Exception(f"method should be one of {list(methods.keys())}")
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    transform_train = transforms.Compose(
-        [transforms.ToTensor(),
-        #torchvision.transforms.ToTensor() accept PIL Image or numpy.ndarray,
-         ## first convert HWC to CHW, then convert to float, each pixel /255.
-         # transforms.Resize(224),
-         transforms.Resize(32),
-         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
+    gpu_num = 0
+    use_cuda = torch.cuda.is_available()
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
+    # transform_train = transforms.Compose(
+    #     [transforms.ToTensor(),
+    #     #torchvision.transforms.ToTensor() accept PIL Image or numpy.ndarray,
+    #      ## first convert HWC to CHW, then convert to float, each pixel /255.
+    #      # transforms.Resize(224),
+    #      transforms.Resize(32),
+    #      transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    #     # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    #     ]) # used for extracting cam
 
     transform_test = transforms.Compose([
         transforms.ToTensor(),
@@ -168,38 +200,56 @@ if __name__ == '__main__':
     if args.method not in methods:
         raise Exception(f"Method {args.method} not implemented")
 
-    
+    # triplet_loss = nn.TripletMarginLoss(margin=1.0, p=2)
+    loss_mse = nn.MSELoss()
+    # student = resnet18()
     student = resnet18()
-    param_count_student=count_param(student)
-    print('student parameters = ', param_count_student)
-    student = torch.nn.DataParallel(student)
-    student = student.cuda()
-    student.train()
-    optimizer = optim.SGD(student.parameters(), lr=0.1, momentum=0.9, weight_decay=2e-4)
+    # param_count_student=count_param(student)
+    # print('student parameters = ', param_count_student)
+    # student = torch.nn.DataParallel(student)
+    # student = student.cuda()
+    # target_layer_student = [student.module.layer4[1].conv2]
+
     def kl_loss(a,b):
         loss = -a*b + torch.log(b+1e-5)*b
         return loss
     teacher = wideresnet()
+    # teacher = WideResNet()
     teacher.load_state_dict(torch.load('./models/model_cifar_wrn.pt'))
     param_count_teacher=count_param(teacher)
     print('teacher parameters = ', param_count_teacher)
-    teacher = torch.nn.DataParallel(teacher)
-    teacher = teacher.cuda()
-    teacher.eval()
+    # teacher = torch.nn.DataParallel(teacher)
+    # teacher = teacher.cuda()
+    # teacher.eval()
     # the target layer you want to visualize
-    target_layer = [teacher.module.block3.layer[4].conv2]
+    # target_layer = [teacher.module.block3.layer[4].conv2]
+    # distiller = distiller_mine.Distiller(teacher, student)
     # target_layer = teacher.module.block3.layer[4].conv2
-    if args.method == "ablationcam":
-        cam = methods[args.method](model=teacher,
-                                   target_layers=target_layer,
-                                   use_cuda=args.use_cuda,
-                                   reshape_transform=reshape_transform,
-                                   ablation_layer=AblationLayerVit())
+    if torch.cuda.device_count() > 1:
+        teacher = nn.DataParallel(teacher).to(device)
+        student = nn.DataParallel(student).to(device)
     else:
-        cam = methods[args.method](model=teacher,
-                                   target_layers=target_layer,
-                                   use_cuda=args.use_cuda,
-                                   reshape_transform=reshape_transform)
+        teacher = teacher.to(device)
+        student = student.to(device)
+    test(teacher,testloader)
+    student.train()
+    teacher.eval()
+    optimizer = optim.SGD(student.parameters(), lr=0.1, momentum=0.9, weight_decay=2e-4)
+    # if args.method == "ablationcam":
+    #     cam = methods[args.method](model=teacher,
+    #                                target_layers=target_layer,
+    #                                use_cuda=args.use_cuda,
+    #                                reshape_transform=reshape_transform,
+    #                                ablation_layer=AblationLayerVit())
+    # else:
+    #     cam = methods[args.method](model=teacher,
+    #                                target_layers=target_layer,
+    #                                use_cuda=args.use_cuda,
+    #                                reshape_transform=reshape_transform)
+    #     cam_student = methods[args.method](model=student,
+    #                                target_layers=target_layer_student,
+    #                                use_cuda=args.use_cuda,
+    #                                reshape_transform=reshape_transform)
 
     for epoch in range(1,epochs+1):
         for step,(train_batch_data,train_batch_labels) in enumerate(trainloader):
@@ -208,7 +258,7 @@ if __name__ == '__main__':
             # If None, returns the map for the highest scoring category.
             # Otherwise, targets the requested category.
             targets = None
-            saveCam(cam=cam,batch_size=batch_size,targets=None,input_tensor=train_batch_data,train_batch_data=train_batch_data,file_name='cam_natural')
+            # grayscale_cams_nat_t = saveCam(cam=cam,batch_size=batch_size,targets=None,input_tensor=train_batch_data,train_batch_data=train_batch_data,file_name='cam_natural')
 
 # ---------------------------------------------------------------------------------------------------
 # # single image GradCAM
@@ -234,35 +284,70 @@ if __name__ == '__main__':
             train_batch_labels = train_batch_labels.cuda()
             optimizer.zero_grad()
             with torch.no_grad():
-                teacher_logits = teacher(train_batch_data)
+                # teacher_logits = teacher(train_batch_data)
+                t_feats, teacher_logits = teacher.extract_feature(train_batch_data, preReLU=True)
+                # outputs, loss_distill, loss_spectral,t_feats, teacher_logits,s_nat_feats, s_nat_logits = distiller(train_batch_data)
 
-            adv_logits,train_batch_data_adv = rslad_inner_loss(student,teacher_logits,train_batch_data,train_batch_labels,optimizer,step_size=2/255.0,epsilon=epsilon,perturb_steps=10)
-            saveCam(cam=cam, batch_size=batch_size, targets=None, input_tensor=train_batch_data_adv,
-                    train_batch_data=train_batch_data,file_name='cam_adv')
+            s_adv_logits,train_batch_data_adv,s_adv_feats = rslad_inner_loss(student,teacher_logits,
+                                                                                        train_batch_data,
+                                                                                        train_batch_labels,
+                                                                                        optimizer,
+                                                                                        step_size=2/255.0,
+                                                                                        epsilon=epsilon,
+                                                                                        perturb_steps=10)
+            # grayscale_cams_adv_s = saveCam(cam=cam_student, batch_size=batch_size, targets=None, input_tensor=train_batch_data_adv,
+            #         train_batch_data=train_batch_data,file_name='cam_adv')
             student.train()
-            nat_logits = student(train_batch_data)
-            kl_Loss1 = kl_loss(F.log_softmax(adv_logits,dim=1),F.softmax(teacher_logits.detach(),dim=1))
-            kl_Loss2 = kl_loss(F.log_softmax(nat_logits,dim=1),F.softmax(teacher_logits.detach(),dim=1))
+            s_nat_logits = student(train_batch_data)
+            s_nat_feats = student.extract_feature(train_batch_data)
+
+
+            #############################loss_triple#################################
+            anchor = t_feats
+            positive = s_nat_feats
+            negative = s_adv_feats
+            feat_num = len(t_feats)
+            loss_mse_adv = 0
+            loss_mse_stu = 0
+            # loss_triple = 0
+            for i in range(feat_num):
+                if anchor[i].size(1) > positive[i].size(1):
+                    anchor[i] = F.adaptive_avg_pool3d(anchor[i], (positive[i].size(1), positive[i].size(2),positive[i].size(3)))
+                # loss_triple += triplet_loss(anchor[i], positive[i], negative[i]) \
+                #                 / 2 ** (feat_num - i - 1)
+                loss_mse_adv += loss_mse(anchor[i], negative[i]) \
+                                / 2 ** (feat_num - i - 1)
+                loss_mse_stu += loss_mse(anchor[i],positive[i])/ 2 ** (feat_num - i - 1)
+
+            ##############################################################
+            # output = triplet_loss(anchor, positive, negative)
+            # loss_triple.backward()
+            kl_Loss1 = kl_loss(F.log_softmax(s_adv_logits,dim=1),F.softmax(teacher_logits.detach(),dim=1))
+            kl_Loss2 = kl_loss(F.log_softmax(s_nat_logits,dim=1),F.softmax(teacher_logits.detach(),dim=1))
             kl_Loss1 = torch.mean(kl_Loss1)
             kl_Loss2 = torch.mean(kl_Loss2)
-            loss = 5/6.0*kl_Loss1 + 1/6.0*kl_Loss2
+            # loss = 5/6.0*kl_Loss1 + 1/6.0*kl_Loss2
+            loss = 5 / 6.0 * kl_Loss1 + 1 / 6.0 * kl_Loss2 + (5/6.0 * loss_mse_adv + 1/6.0 * loss_mse_stu)*0
             loss.backward()
             optimizer.step()
             if step%100 == 0:
                 print('loss',loss.item())
-        if (epoch%20 == 0 and epoch <215) or (epoch%1 == 0 and epoch >= 215):
+        # if (epoch%20 == 0 and epoch <215) or (epoch%1 == 0 and epoch >= 215):
+        if (epoch % 20 == 0 and epoch < 215) or (epoch % 1 == 0 and epoch >= 215):
             test_accs = []
             student.eval()
             for step,(test_batch_data,test_batch_labels) in enumerate(testloader):
+                test_batch_data = test_batch_data.float().cuda()
+                test_batch_labels = test_batch_labels.cuda()
                 test_ifgsm_data = attack_pgd(student,test_batch_data,test_batch_labels,attack_iters=20,step_size=0.003,epsilon=8.0/255.0)
-                logits = student(test_ifgsm_data)
+                logits = student(test_ifgsm_data.cuda())
                 predictions = np.argmax(logits.cpu().detach().numpy(),axis=1)
                 predictions = predictions - test_batch_labels.cpu().detach().numpy()
                 test_accs = test_accs + predictions.tolist()
             test_accs = np.array(test_accs)
             test_acc = np.sum(test_accs==0)/len(test_accs)
             print('robust acc',np.sum(test_accs==0)/len(test_accs))
-            torch.save(student.state_dict(),'./models/'+prefix+str(np.sum(test_accs==0)/len(test_accs))+'.pth')
+            torch.save(student.state_dict(),'./models_triple/'+prefix+str(np.sum(test_accs==0)/len(test_accs))+'.pth')
         if epoch in [215,260,285]:
             for param_group in optimizer.param_groups:
                 param_group['lr'] *= 0.1

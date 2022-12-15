@@ -6,6 +6,17 @@ from cifar10_models import *
 import torchvision
 from torchvision import datasets, transforms
 import time
+import numpy as np
+import skimage.transform
+import torch.nn as nn
+import torch.nn. functional as F
+from PIL import Image
+from matplotlib.pyplot import imshow
+from torchvision import models, transforms
+from torchvision.utils import save_image
+from cam import CAM, GradCAM
+from rise import RISE
+from utils.visualize import visualize, reverse_normalize
 # we fix the random seed to 0, in the same computer, this method can make the results same as before.
 torch.manual_seed(0)
 torch.cuda.manual_seed_all(0)
@@ -14,8 +25,12 @@ torch.backends.cudnn.deterministic = True
 prefix = 'mobilenet_v2-CIFAR10_RSLAD'
 epochs = 300
 batch_size = 128
-epsilon = 8/255.0
-
+epsilon = 8/255.0 # perturbation
+def count_param(model):
+    param_count = 0
+    for param in model.parameters():
+        param_count += param.view(-1).size()[0]
+    return param_count
 transform_train = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
@@ -32,6 +47,8 @@ testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True
 testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
 
 student = mobilenet_v2()
+param_count_student=count_param(student)
+print('student parameters = ', param_count_student)
 student = torch.nn.DataParallel(student)
 student = student.cuda()
 student.train()
@@ -41,12 +58,28 @@ def kl_loss(a,b):
     return loss
 teacher = wideresnet()
 teacher.load_state_dict(torch.load('./models/model_cifar_wrn.pt'))
+param_count_teacher=count_param(teacher)
+print('teacher parameters = ', param_count_teacher)
 teacher = torch.nn.DataParallel(teacher)
 teacher = teacher.cuda()
 teacher.eval()
-
+# the target layer you want to visualize
+# target_layer = model.layer4[1].conv2
 for epoch in range(1,epochs+1):
     for step,(train_batch_data,train_batch_labels) in enumerate(trainloader):
+        _, _, H, W = train_batch_data.shape
+        wrapped_model = GradCAM(student, input_size=(H, W))
+        with torch.no_grad():
+            saliency = wrapped_model(train_batch_data[0])
+        saliency = saliency[0]
+        # reverse normalization for display
+        img = reverse_normalize(train_batch_data.to('cpu'))[0]
+        img=img.unsqueeze(0)
+        saliency = saliency.view(1, 1, H, W)
+        heatmap = visualize(img, saliency)
+        # or visualize 
+        hm = (heatmap.squeeze().numpy().transpose(1, 2, 0)).astype(np.int32)
+        imshow(hm)
         student.train()
         train_batch_data = train_batch_data.float().cuda()
         train_batch_labels = train_batch_labels.cuda()
@@ -78,7 +111,7 @@ for epoch in range(1,epochs+1):
         test_accs = np.array(test_accs)
         test_acc = np.sum(test_accs==0)/len(test_accs)
         print('robust acc',np.sum(test_accs==0)/len(test_accs))
-        torch.save(student.state_dict(),'./models/'+prefix+str(np.sum(test_accs==0)/len(test_accs))+'.pth')
+        torch.save(student.state_dict(),'./models_mo/'+prefix+str(np.sum(test_accs==0)/len(test_accs))+'.pth')
     if epoch in [215,260,285]:
         for param_group in optimizer.param_groups:
             param_group['lr'] *= 0.1
